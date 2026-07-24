@@ -1,0 +1,36 @@
+name: Production smoke test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RENDER_URL: https://stock-portfolio-api-zecl.onrender.com
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for Render deploy
+        run: sleep 90
+
+      - name: Health check
+        run: |
+          set -e
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i..."
+            BODY=$(curl -sf "${RENDER_URL}/api/health" || true)
+            echo "$BODY"
+            if echo "$BODY" | grep -q '"status"'; then
+              echo "$BODY" | grep -q '"stocks_count"' && exit 0
+            fi
+            sleep 30
+          done
+          echo "Health check failed after retries"
+          exit 1
+
+      - name: OpenAPI reachable
+        run: curl -sf "${RENDER_URL}/openapi.json" | head -c 200
