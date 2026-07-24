@@ -16,6 +16,38 @@ from database import engine
 from models import Base
 
 Base.metadata.create_all(bind=engine)
+
+
+def _ensure_sqlite_columns():
+    """Add columns added after first deploy (SQLite has no ALTER in create_all)."""
+    from sqlalchemy import text
+
+    if not str(engine.url).startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(stock_features)")).fetchall()
+        cols = {row[1] for row in rows}
+        if "day_change_pct" not in cols:
+            conn.execute(text("ALTER TABLE stock_features ADD COLUMN day_change_pct FLOAT"))
+            log.info("Migration: stock_features.day_change_pct added")
+        stock_rows = conn.execute(text("PRAGMA table_info(stocks)")).fetchall()
+        stock_cols = {row[1] for row in stock_rows}
+        if "possible_value_trap" not in stock_cols:
+            conn.execute(
+                text("ALTER TABLE stocks ADD COLUMN possible_value_trap BOOLEAN NOT NULL DEFAULT 0")
+            )
+            log.info("Migration: stocks.possible_value_trap added")
+        note_rows = conn.execute(text("PRAGMA table_info(dividend_calendar_notes)")).fetchall()
+        note_cols = {row[1] for row in note_rows}
+        if note_rows and "title" not in note_cols:
+            conn.execute(text("ALTER TABLE dividend_calendar_notes ADD COLUMN title VARCHAR(255) DEFAULT ''"))
+            log.info("Migration: dividend_calendar_notes.title added")
+        if note_rows and "updated_at" not in note_cols:
+            conn.execute(text("ALTER TABLE dividend_calendar_notes ADD COLUMN updated_at DATETIME"))
+            log.info("Migration: dividend_calendar_notes.updated_at added")
+
+
+_ensure_sqlite_columns()
 log.info("Database tables ready")
 
 app = FastAPI(title="Stock Portfolio Unifier", version="1.0.0")
@@ -69,6 +101,16 @@ from routers.analytics import router as analytics_router
 from routers.charts import router as charts_router
 from routers.arbitrage import router as arbitrage_router
 from routers.fair_value import router as fair_value_router
+from routers.limitless import router as limitless_router
+from routers.polymarket import router as polymarket_router
+from routers.prediction_compare import router as prediction_compare_router
+from routers.market_charts import router as market_charts_router
+from routers.x_feeds import router as x_feeds_router
+from routers.news_sentiment import router as news_sentiment_router
+from routers.valuation import router as valuation_router
+from routers.journal import router as journal_router
+from routers.forex import router as forex_router
+from routers.cluster_explorer import router as cluster_router
 
 app.include_router(stocks_router)
 app.include_router(portfolios_router)
@@ -77,6 +119,16 @@ app.include_router(analytics_router)
 app.include_router(charts_router)
 app.include_router(arbitrage_router)
 app.include_router(fair_value_router)
+app.include_router(limitless_router)
+app.include_router(polymarket_router)
+app.include_router(prediction_compare_router)
+app.include_router(market_charts_router)
+app.include_router(x_feeds_router)
+app.include_router(news_sentiment_router)
+app.include_router(valuation_router)
+app.include_router(journal_router)
+app.include_router(forex_router)
+app.include_router(cluster_router)
 
 
 @app.get("/api/health")
@@ -93,7 +145,7 @@ def health():
         db.close()
 
 
-@app.get("/api/etl/run")
+@app.post("/api/etl/run")
 def run_etl():
     from etl.load_features import run as run_features
     from etl.load_div_events import run as run_divs

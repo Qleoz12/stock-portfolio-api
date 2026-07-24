@@ -1,0 +1,36 @@
+{
+  "columns": [
+    {
+      "id": "es_inversion",
+      "label": "Inversión ES",
+      "handles": [
+        "mrpinatv",
+        "dividendiolo",
+        "JpInversionista",
+        "Portafolioco",
+        "ToroDeArena",
+        "MPFinanzas"
+      ]
+    },
+    {
+      "id": "macro_medios",
+      "label": "Macro / medios",
+      "handles": [
+        "Reuters",
+        "markets",
+        "economics",
+        "HFI_Research"
+      ]
+    },
+    {
+      "id": "flows_alertas",
+      "label": "Flows / alertas",
+      "handles": [
+        "zerohedge",
+        "Barchart",
+        "unusual_whales",
+        "quantscience_"
+      ]
+    }
+  ]
+}

@@ -7,3 +7,13 @@ yfinance
 python-dateutil
 pydantic
 httpx
+feedparser
+vaderSentiment
+scipy
+scikit-learn
+scikit-learn-extra
+pyarrow
+pyyaml
+numpy
+nbformat
+nbconvert

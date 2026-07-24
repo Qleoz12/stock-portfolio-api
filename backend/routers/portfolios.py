@@ -36,6 +36,9 @@ class SnapshotCreate(BaseModel):
     total_dividends: float = 0
     notes: str = ""
 
+class SnapshotNotesPatch(BaseModel):
+    notes: str
+
 class HoldingOut(BaseModel):
     id: int
     stock_id: int
@@ -201,6 +204,43 @@ def add_holding(pid: int, data: HoldingCreate, db: Session = Depends(get_db)):
                        is_quanfury=stock.is_quanfury_available)
 
 
+@router.put("/{pid}/holdings/{hid}", response_model=HoldingOut)
+def update_holding(pid: int, hid: int, data: HoldingUpdate, db: Session = Depends(get_db)):
+    if data.shares is None and data.avg_price is None:
+        raise HTTPException(status_code=400, detail="Provide at least one of shares or avg_price")
+    h = db.query(PortfolioHolding).filter_by(id=hid, portfolio_id=pid).first()
+    if not h:
+        raise HTTPException(status_code=404, detail="Holding not found")
+    if data.shares is not None:
+        if data.shares <= 0:
+            raise HTTPException(status_code=400, detail="shares must be positive")
+        h.shares = data.shares
+    if data.avg_price is not None:
+        if data.avg_price < 0:
+            raise HTTPException(status_code=400, detail="avg_price cannot be negative")
+        h.avg_price = data.avg_price
+    db.commit()
+    db.refresh(h)
+    stock = db.query(Stock).filter_by(id=h.stock_id).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    feat = db.query(StockFeature).filter_by(stock_id=stock.id).first()
+    cp = feat.last_close if feat else None
+    cv = cp * h.shares if cp else None
+    cost = h.avg_price * h.shares if h.avg_price else None
+    gp = ((cv - cost) / cost * 100) if cv and cost and cost > 0 else None
+    ad = (feat.dividend_ttm or 0) * h.shares if feat else None
+    return HoldingOut(
+        id=h.id, stock_id=h.stock_id, ticker_yf=stock.ticker_yf,
+        company_name=stock.company_name, symbol=stock.symbol, shares=h.shares,
+        avg_price=h.avg_price, current_price=cp, current_value=cv,
+        gain_pct=round(gp, 2) if gp is not None else None,
+        div_yield_ttm=feat.div_yield_ttm if feat else None,
+        annual_dividend=round(ad, 2) if ad else None,
+        is_quanfury=stock.is_quanfury_available,
+    )
+
+
 @router.delete("/{pid}/holdings/{hid}")
 def remove_holding(pid: int, hid: int, db: Session = Depends(get_db)):
     h = db.query(PortfolioHolding).filter_by(id=hid, portfolio_id=pid).first()
@@ -232,3 +272,13 @@ def get_snapshots(pid: int, db: Session = Depends(get_db)):
     return [{"id": s.id, "month": s.month, "year": s.year, "total_value": s.total_value,
              "total_dividends": s.total_dividends, "notes": s.notes or ""}
             for s in db.query(PortfolioSnapshot).filter_by(portfolio_id=pid).order_by(PortfolioSnapshot.year, PortfolioSnapshot.month).all()]
+
+
+@router.patch("/snapshots/{snapshot_id}")
+def patch_snapshot_notes(snapshot_id: int, data: SnapshotNotesPatch, db: Session = Depends(get_db)):
+    snap = db.query(PortfolioSnapshot).filter_by(id=snapshot_id).first()
+    if not snap:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    snap.notes = data.notes
+    db.commit()
+    return {"ok": True, "id": snap.id, "notes": snap.notes or ""}

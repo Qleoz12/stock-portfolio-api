@@ -1,0 +1,55 @@
+profiles:
+  ALL_CLUSTERING_ELIGIBLE_FEATURES:
+    display_name: All Clustering-Eligible Features
+    description: Numeric features eligible for clustering (excludes metadata and raw price/size levels).
+  ALL_VALID_FINANCIAL_FEATURES:
+    display_name: All Valid Financial Features (legacy alias)
+    description: Alias for ALL_CLUSTERING_ELIGIBLE_FEATURES.
+  TECHNICAL_RATIOS:
+    display_name: Technical Ratios
+    description: Transformed technical ratios (not absolute EMA/MACD levels).
+    features:
+      - price_to_ema20
+      - price_to_ema52
+      - price_to_ema200
+      - normalized_macd
+      - normalized_macd_signal
+      - rsi_14
+      - distance_from_52w_high
+      - distance_from_52w_low
+  CORE_RISK_RETURN:
+    display_name: Core Risk and Return
+    features:
+      - annualized_return
+      - volatility_1y
+      - beta
+      - max_drawdown
+      - average_correlation
+  TECHNICAL:
+    display_name: Technical Indicators
+    features:
+      - ema_20
+      - ema_52
+      - ema_200
+      - macd
+      - macd_signal
+      - rsi_14
+  FUNDAMENTALS:
+    display_name: Fundamentals
+    features:
+      - net_income_margin
+      - return_on_assets
+      - fcf_yield
+      - debt_to_equity
+      - health_score
+      - div_yield_ttm
+  DIVIDEND:
+    display_name: Dividend Portfolio
+    features:
+      - div_yield_ttm
+      - dividend_ttm
+      - payments_ttm
+      - dividend_score
+  CORRELATION_CLUSTERING:
+    display_name: Correlation Clustering
+    description: Uses return correlation matrix (no feature columns).

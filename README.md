@@ -1,26 +1,47 @@
 # Stock Portfolio API
 
-Backend FastAPI para análisis de acciones (TSX, NYSE, LSE, NASDAQ) con enriquecimiento vía Yahoo Finance.
+Backend FastAPI para análisis de acciones. Desplegado en [Render](https://render.com).
 
-Este repo contiene solo el **API** desplegable en [Render](https://render.com). El frontend vive en un repo separado: `stock-portfolio-web`.
+La base de datos **no** va en git. Se descarga al arrancar desde un **GitHub Release privado** (`stock-portfolio-db`).
 
 ## Estructura
 
 ```
 stock-portfolio-api/
-├── backend/          # FastAPI app
-├── data/             # CSVs y JSON para el pipeline ETL
-├── scripts/          # Utilidades CLI (add_stocks, test_api)
-├── render.yaml       # Deploy automático en Render
+├── backend/                 # FastAPI + Docker
+│   ├── scripts/download_db.py
+│   └── docker-entrypoint.sh
+├── data/                    # CSVs para ETL (opcional)
+├── render.yaml
 └── .env.example
 ```
+
+## DB en producción (GitHub Release)
+
+```
+Render arranca
+    → download_db.py
+    → descarga stock_unifier.db del Release (GITHUB_TOKEN)
+    → uvicorn
+```
+
+| Variable | Descripción |
+|----------|-------------|
+| `GITHUB_TOKEN` | PAT fine-grained, Contents:Read en `stock-portfolio-db` |
+| `DB_REPO` | `Qleoz12/stock-portfolio-db` |
+| `DB_RELEASE_TAG` | ej. `v1.0.0` |
+| `DATABASE_PATH` | `/app/stock_unifier.db` |
+| `CORS_ORIGINS` | URL del frontend (GitHub Pages) |
+
+Publicar nueva DB: ver repo `stock-portfolio-db` → `publish.ps1`.
 
 ## Quick Start (local)
 
 ```bash
 cd backend
 pip install -r requirements.txt
-cp ../.env.example ../.env
+# Usa la DB local de dataAnalitics o copia stock_unifier.db aquí
+set DATABASE_PATH=stock_unifier.db
 python main.py
 ```
 
@@ -28,35 +49,29 @@ python main.py
 - Docs: `http://localhost:8000/docs`
 - Health: `http://localhost:8000/api/health`
 
-### Cargar datos iniciales
+## Deploy en Render (Docker)
 
-En el Dashboard del frontend, o vía API:
+1. Push a `Qleoz12/stock-portfolio-api`
+2. **Settings → Root Directory:** `backend`
+3. **Environment:**
+   - `GITHUB_TOKEN` = tu PAT (secret)
+   - `DB_RELEASE_TAG` = `v1.0.0`
+   - `DB_REPO` = `Qleoz12/stock-portfolio-db`
+   - `DATABASE_PATH` = `/app/stock_unifier.db`
+4. **Health Check Path:** `/api/health`
+5. Deploy
 
-```bash
-curl http://localhost:8000/api/etl/run
-```
-
-## Variables de entorno
-
-| Variable | Descripción | Local | Render |
-|----------|-------------|-------|--------|
-| `DATABASE_PATH` | Ruta SQLite | `./backend/stock_unifier.db` | `/var/data/stock_unifier.db` |
-| `DATA_DIR` | CSVs/JSON del ETL | `./data` | `/opt/render/project/src/data` |
-| `CORS_ORIGINS` | Orígenes permitidos | `http://localhost:5173` | URL del frontend |
-
-## Deploy en Render
-
-1. Crear repo en GitHub: `Qleoz12/stock-portfolio-api`
-2. Push de este código a `main`
-3. En Render: **New → Blueprint** (detecta `render.yaml`)
-4. Verificar: `https://TU-URL.onrender.com/api/health`
-
-## Scripts útiles
+Verificar:
 
 ```bash
-# Agregar acciones
-python scripts/add_stocks.py NFLX GOOG
-
-# Probar endpoints
-python scripts/test_api.py
+curl https://TU-URL.onrender.com/api/health
+# {"status":"ok","stocks_count":7876}
 ```
+
+## Actualizar DB en producción
+
+1. En `stock-portfolio-db`: `.\publish.ps1 -Tag v1.0.1`
+2. En Render: `DB_RELEASE_TAG=v1.0.1`
+3. Borrar la DB efímera: **Manual Deploy** (re-descarga al boot)
+
+> En plan Free la DB vive en el contenedor. Cada redeploy vuelve a descargar del Release.

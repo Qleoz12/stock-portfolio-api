@@ -7,10 +7,81 @@ from datetime import date, datetime, timedelta
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from database import get_db
-from models import Stock, StockOHLCV, ChartDrawing
+from models import Stock, StockOHLCV, ChartDrawing, StockFeature
 from logger import get_logger
 
 log = get_logger("charts")
+
+_OHLC_LEVEL_NAMES = frozenset(
+    {"open", "high", "low", "close", "adj close", "volume"}
+)
+
+
+def _flatten_yfinance_hist(hist):
+    """Pick the correct MultiIndex level (Price vs Ticker) so OHLC columns stay named Open/High/…"""
+    if hist is None or hist.empty:
+        return hist
+    if getattr(hist.columns, "nlevels", 1) <= 1:
+        return hist
+    lev0 = {str(x).lower() for x in hist.columns.get_level_values(0)}
+    lev1 = {str(x).lower() for x in hist.columns.get_level_values(1)}
+    n0 = sum(1 for x in lev0 if x in _OHLC_LEVEL_NAMES)
+    n1 = sum(1 for x in lev1 if x in _OHLC_LEVEL_NAMES)
+    if n0 >= 3 and n1 < n0:
+        return hist.droplevel(1, axis=1)
+    if n1 >= 3 and n0 < n1:
+        return hist.droplevel(0, axis=1)
+    return hist.droplevel(1, axis=1)
+
+
+def _spot_last_close_yahoo(ticker_yf: str):
+    import yfinance as yf
+
+    try:
+        h = yf.download(
+            ticker_yf,
+            period="5d",
+            progress=False,
+            timeout=15,
+            auto_adjust=False,
+        )
+    except Exception as e:
+        log.debug("spot Yahoo close failed for %s: %s", ticker_yf, e)
+        return None
+    if h is None or h.empty:
+        return None
+    h = _flatten_yfinance_hist(h)
+    if "Close" not in h.columns:
+        return None
+    close = h["Close"].dropna()
+    if hasattr(close, "columns"):
+        close = close.iloc[:, 0]
+    if close.empty:
+        return None
+    return float(close.iloc[-1])
+
+
+def _ohlcv_cache_disagrees_with_yahoo(stock: Stock, db: Session) -> bool:
+    """True if the latest cached bar is far from live Yahoo (bad cache / wrong columns / stale mix)."""
+    last_bar = (
+        db.query(StockOHLCV)
+        .filter(StockOHLCV.stock_id == stock.id)
+        .order_by(StockOHLCV.date.desc())
+        .first()
+    )
+    if not last_bar or not last_bar.close:
+        return False
+
+    feat = db.query(StockFeature).filter_by(stock_id=stock.id).first()
+    if feat and feat.last_close:
+        lc, fc = float(last_bar.close), float(feat.last_close)
+        if lc > 0 and fc > 0 and max(lc, fc) / min(lc, fc) <= 1.25:
+            return False
+
+    y = _spot_last_close_yahoo(stock.ticker_yf)
+    if y is None or last_bar.close <= 0:
+        return False
+    return max(y, float(last_bar.close)) / min(y, float(last_bar.close)) > 5.0
 
 router = APIRouter(prefix="/api/stocks", tags=["charts"])
 
@@ -44,6 +115,21 @@ def _ensure_ohlcv_cache(stock: Stock, db: Session):
     # Evita "una sola vela": antes se salía si el último día era reciente aunque hubiera <~3 meses de historia.
     adequate = row_count >= 60 and span_days >= 120
 
+    if row_count > 0 and _ohlcv_cache_disagrees_with_yahoo(stock, db):
+        deleted = (
+            db.query(StockOHLCV)
+            .filter(StockOHLCV.stock_id == stock.id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        log.warning(
+            "OHLCV: removed %s cached rows for %s (latest close out of band vs Yahoo)",
+            deleted,
+            stock.ticker_yf,
+        )
+        last_cached = None
+        adequate = False
+
     if last_cached and (today - last_cached).days <= 1 and adequate:
         return
 
@@ -70,8 +156,7 @@ def _ensure_ohlcv_cache(stock: Stock, db: Session):
     if hist is None or hist.empty:
         return
 
-    if hasattr(hist.columns, 'nlevels') and hist.columns.nlevels > 1:
-        hist = hist.droplevel(1, axis=1)
+    hist = _flatten_yfinance_hist(hist)
 
     col_map = {}
     for col in hist.columns:

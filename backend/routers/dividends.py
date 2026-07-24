@@ -60,13 +60,24 @@ class DividendCalendarItem(BaseModel):
     prior_year_div_date: Optional[str] = None
     projection_source: Optional[str] = None
     manual_entry_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+class DividendCalendarPageOut(BaseModel):
+    items: list[DividendCalendarItem]
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
 
 
 class CalendarNoteOut(BaseModel):
     id: int
     note_date: str
+    title: Optional[str] = None
     body: str
     created_at: str
+    updated_at: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -74,7 +85,18 @@ class CalendarNoteOut(BaseModel):
 
 class CalendarNoteCreate(BaseModel):
     note_date: str
+    title: Optional[str] = Field(default=None, max_length=255)
     body: str = Field(..., min_length=1, max_length=8000)
+
+
+class CalendarNotePatch(BaseModel):
+    note_date: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=255)
+    body: Optional[str] = Field(default=None, min_length=1, max_length=8000)
+
+
+class ManualDividendNotePatch(BaseModel):
+    note: str = Field(..., min_length=1, max_length=2000)
 
 
 class ManualDividendCreate(BaseModel):
@@ -119,13 +141,15 @@ def _parse_date_param(val: Optional[str], default: date) -> date:
         return default
 
 
-@router.get("/calendar", response_model=list[DividendCalendarItem])
+@router.get("/calendar", response_model=DividendCalendarPageOut)
 def dividend_calendar(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     exchange: Optional[str] = Query(None),
     portfolio_id: Optional[int] = Query(None),
     quanfury_only: bool = Query(False),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(500, ge=1, le=2000),
     db: Session = Depends(get_db),
 ):
     start_dt = _parse_date_param(start_date, date.today() - timedelta(days=30))
@@ -252,6 +276,7 @@ def dividend_calendar(
             prior_year_div_date=None,
             projection_source=None,
             manual_entry_id=man.id,
+            note=(man.note or "").strip() or None,
         ))
 
     for qd in db.query(QuanfuryDividend).filter(QuanfuryDividend.div_date.between(start_dt, end_dt)).all():
@@ -280,7 +305,17 @@ def dividend_calendar(
         ))
 
     results.sort(key=lambda x: x.date)
-    return results
+    total = len(results)
+    start = (page - 1) * page_size
+    chunk = results[start : start + page_size]
+    has_more = start + len(chunk) < total
+    return DividendCalendarPageOut(
+        items=chunk,
+        total=total,
+        page=page,
+        page_size=page_size,
+        has_more=has_more,
+    )
 
 
 @router.get("/upcoming")
@@ -313,6 +348,17 @@ def dividend_stats(db: Session = Depends(get_db)):
     }
 
 
+def _calendar_note_out(r: DividendCalendarNote) -> CalendarNoteOut:
+    return CalendarNoteOut(
+        id=r.id,
+        note_date=str(r.note_date),
+        title=(r.title or "").strip() or None,
+        body=r.body or "",
+        created_at=r.created_at.isoformat() if r.created_at else "",
+        updated_at=r.updated_at.isoformat() if r.updated_at else None,
+    )
+
+
 @router.get("/calendar-notes", response_model=list[CalendarNoteOut])
 def list_calendar_notes(
     start_date: Optional[str] = Query(None),
@@ -331,14 +377,7 @@ def list_calendar_notes(
     )
     out: list[CalendarNoteOut] = []
     for r in rows:
-        out.append(
-            CalendarNoteOut(
-                id=r.id,
-                note_date=str(r.note_date),
-                body=r.body or "",
-                created_at=r.created_at.isoformat() if r.created_at else "",
-            )
-        )
+        out.append(_calendar_note_out(r))
     return out
 
 
@@ -348,16 +387,31 @@ def create_calendar_note(body: CalendarNoteCreate, db: Session = Depends(get_db)
     text = (body.body or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="El texto de la nota no puede estar vacío.")
-    row = DividendCalendarNote(note_date=nd, body=text)
+    row = DividendCalendarNote(note_date=nd, title=(body.title or "").strip(), body=text)
     db.add(row)
     db.commit()
     db.refresh(row)
-    return CalendarNoteOut(
-        id=row.id,
-        note_date=str(row.note_date),
-        body=row.body or "",
-        created_at=row.created_at.isoformat() if row.created_at else "",
-    )
+    return _calendar_note_out(row)
+
+
+@router.patch("/calendar-notes/{note_id}", response_model=CalendarNoteOut)
+def patch_calendar_note(note_id: int, body: CalendarNotePatch, db: Session = Depends(get_db)):
+    row = db.query(DividendCalendarNote).filter_by(id=note_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nota no encontrada")
+    if body.note_date is not None:
+        row.note_date = _parse_date_param(body.note_date, row.note_date)
+    if body.title is not None:
+        row.title = body.title.strip()
+    if body.body is not None:
+        text = body.body.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="El texto de la nota no puede estar vacío.")
+        row.body = text
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return _calendar_note_out(row)
 
 
 @router.delete("/calendar-notes/{note_id}")
@@ -436,6 +490,19 @@ def delete_manual_calendar_dividend_v2(entry_id: int, db: Session = Depends(get_
     db.delete(row)
     db.commit()
     return {"ok": True}
+
+
+@router.patch("/calendar/manual/{entry_id}")
+def patch_manual_calendar_dividend_note(entry_id: int, body: ManualDividendNotePatch, db: Session = Depends(get_db)):
+    row = db.query(ManualCalendarDividend).filter_by(id=entry_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Manual entry not found")
+    text = body.note.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="El texto de la nota no puede estar vacío.")
+    row.note = text
+    db.commit()
+    return {"ok": True, "id": row.id, "note": row.note}
 
 
 @router.delete("/manual/{entry_id}", include_in_schema=False)

@@ -44,6 +44,8 @@ class StockOut(BaseModel):
     week_52_pct: Optional[float] = None
     next_earnings_date: Optional[str] = None
     health_score: Optional[float] = None
+    day_change_pct: Optional[float] = None
+    possible_value_trap: bool = False
     class Config:
         from_attributes = True
 
@@ -66,6 +68,11 @@ class StockDetailOut(StockOut):
     net_income: Optional[float] = None
     total_debt: Optional[float] = None
     debt_to_equity: Optional[float] = None
+    next_ex_date: Optional[str] = None
+    next_div_amount: Optional[float] = None
+    days_to_next_ex: Optional[int] = None
+    exp_div_apy_pct: Optional[float] = None
+    next_div_source: Optional[str] = None
     dividend_history: list = []
     portfolios: list = []
 
@@ -108,6 +115,18 @@ def compute_week_pct(price, high, low):
     return max(0, min(100, round((price - low) / (high - low) * 100, 2)))
 
 
+def _pick_evenly_spaced_ids(ids: list, k: int) -> list:
+    """Spread sample across sorted ids (by id) for ~representative subset."""
+    n = len(ids)
+    if n == 0 or k <= 0:
+        return []
+    if k >= n:
+        return list(ids)
+    if k == 1:
+        return [ids[n // 2]]
+    return [ids[int(i * (n - 1) / (k - 1))] for i in range(k)]
+
+
 def _stocks_list_base_query(
     db: Session,
     *,
@@ -115,6 +134,7 @@ def _stocks_list_base_query(
     sector: Optional[str] = None,
     quanfury_only: bool = False,
     search: Optional[str] = None,
+    symbol_exact: bool = False,
     min_div_yield: Optional[float] = None,
     min_rsi: Optional[float] = None,
     max_rsi: Optional[float] = None,
@@ -122,11 +142,15 @@ def _stocks_list_base_query(
     near_52w_low: bool = False,
     min_health_score: Optional[float] = None,
     max_health_score: Optional[float] = None,
+    min_day_change_pct: Optional[float] = None,
+    max_day_change_pct: Optional[float] = None,
+    sp500_only: bool = False,
     divergence: Optional[str] = None,
     ema_52_for_div: bool = True,
     ema_200_for_div: bool = True,
     portfolio_id: Optional[int] = None,
     tech_complete: bool = False,
+    exclude_value_traps: bool = False,
     for_list: bool = True,
 ):
     """Shared filters for stock list + score-trend stats. When for_list=True, eager-loads relations."""
@@ -143,24 +167,46 @@ def _stocks_list_base_query(
         query = query.filter(Stock.sector.ilike(f"%{sector}%"))
     if quanfury_only:
         query = query.filter(Stock.is_quanfury_available == True)
+    if exclude_value_traps:
+        query = query.filter(or_(Stock.possible_value_trap == False, Stock.possible_value_trap.is_(None)))
     if search:
         search_clean = search.strip()
-        # Substring on company name only; tickers use prefix match so "LX" does not match "NFLX".
-        term_sub = f"%{search_clean}%"
-        term_pre = f"{search_clean}%"
-        base = _extract_base_symbol(search_clean)
-        base_pre = f"{base}%"
-        search_conds = or_(
-            Stock.symbol.ilike(term_pre),
-            Stock.ticker_yf.ilike(term_pre),
-            Stock.company_name.ilike(term_sub),
-        )
-        if base.upper() != search_clean.upper():
+        if symbol_exact:
+            # Qualified TICKER:EXCHANGE — exact symbol/ticker only (e.g. P:NYSE → P, not PAAS).
+            exact_up = search_clean.upper()
+            base = _extract_base_symbol(search_clean)
             search_conds = or_(
-                search_conds,
-                Stock.symbol.ilike(base_pre),
-                Stock.ticker_yf.ilike(base_pre),
+                func.upper(Stock.symbol) == exact_up,
+                func.upper(Stock.ticker_yf) == exact_up,
             )
+            if base.upper() != exact_up:
+                search_conds = or_(search_conds, func.upper(Stock.symbol) == base.upper())
+        else:
+            # Substring on company name only; tickers use prefix match so "LX" does not match "NFLX".
+            term_sub = f"%{search_clean}%"
+            term_pre = f"{search_clean}%"
+            base = _extract_base_symbol(search_clean)
+            base_pre = f"{base}%"
+            if len(search_clean) <= 2:
+                # Short tickers (e.g. P, F, AA): symbol/ticker only — avoid matching every company name with "p".
+                search_conds = or_(
+                    Stock.symbol.ilike(search_clean),
+                    Stock.ticker_yf.ilike(search_clean),
+                    Stock.symbol.ilike(term_pre),
+                    Stock.ticker_yf.ilike(term_pre),
+                )
+            else:
+                search_conds = or_(
+                    Stock.symbol.ilike(term_pre),
+                    Stock.ticker_yf.ilike(term_pre),
+                    Stock.company_name.ilike(term_sub),
+                )
+                if base.upper() != search_clean.upper():
+                    search_conds = or_(
+                        search_conds,
+                        Stock.symbol.ilike(base_pre),
+                        Stock.ticker_yf.ilike(base_pre),
+                    )
         query = query.filter(search_conds)
     if min_div_yield:
         query = query.filter(StockFeature.div_yield_ttm >= min_div_yield)
@@ -184,6 +230,22 @@ def _stocks_list_base_query(
         query = query.filter(StockFeature.health_score.isnot(None), StockFeature.health_score >= min_health_score)
     if max_health_score is not None:
         query = query.filter(StockFeature.health_score.isnot(None), StockFeature.health_score <= max_health_score)
+    if min_day_change_pct is not None:
+        query = query.filter(
+            StockFeature.day_change_pct.isnot(None),
+            StockFeature.day_change_pct >= min_day_change_pct,
+        )
+    if max_day_change_pct is not None:
+        query = query.filter(
+            StockFeature.day_change_pct.isnot(None),
+            StockFeature.day_change_pct <= max_day_change_pct,
+        )
+    if sp500_only:
+        from services.sp500_constituents import sp500_symbols
+
+        syms = sp500_symbols()
+        if syms:
+            query = query.filter(Stock.symbol.in_(list(syms)))
 
     if divergence == "strong_below_selected":
         parts = [StockFeature.health_score >= 70]
@@ -192,6 +254,16 @@ def _stocks_list_base_query(
         if ema_200_for_div:
             parts.append(and_(StockFeature.ema_200.isnot(None), StockFeature.last_close < StockFeature.ema_200))
         if len(parts) == 1:
+            query = query.filter(false())
+        else:
+            query = query.filter(and_(*parts))
+    elif divergence == "below_selected_emas":
+        parts = []
+        if ema_52_for_div:
+            parts.append(and_(StockFeature.ema_52.isnot(None), StockFeature.last_close < StockFeature.ema_52))
+        if ema_200_for_div:
+            parts.append(and_(StockFeature.ema_200.isnot(None), StockFeature.last_close < StockFeature.ema_200))
+        if not parts:
             query = query.filter(false())
         else:
             query = query.filter(and_(*parts))
@@ -231,6 +303,7 @@ def list_stocks(
     sector: Optional[str] = Query(None),
     quanfury_only: bool = Query(False),
     search: Optional[str] = Query(None),
+    symbol_exact: bool = Query(False, description="Exact symbol/ticker match (qualified TICKER:EXCHANGE)"),
     sort_by: str = Query("ticker_yf"),
     order: str = Query("asc"),
     near_52w_high: bool = Query(False),
@@ -240,14 +313,18 @@ def list_stocks(
     max_rsi: Optional[float] = Query(None),
     min_health_score: Optional[float] = Query(None),
     max_health_score: Optional[float] = Query(None),
+    min_day_change_pct: Optional[float] = Query(None, description="Inclusive min daily bar change % (e.g. -10)"),
+    max_day_change_pct: Optional[float] = Query(None, description="Inclusive max daily bar change % (e.g. -3.3)"),
+    sp500_only: bool = Query(False, description="Restrict to S&P 500 constituents file"),
     divergence: Optional[str] = Query(
         None,
-        description="strong_below_selected | poor_above_any | poor_above_all",
+        description="strong_below_selected | below_selected_emas | poor_above_any | poor_above_all",
     ),
     ema_52_for_div: bool = Query(True),
     ema_200_for_div: bool = Query(True),
     portfolio_id: Optional[int] = Query(None),
     tech_complete: bool = Query(False),
+    exclude_value_traps: bool = Query(False, description="Hide stocks marked as possible value trap"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -258,6 +335,7 @@ def list_stocks(
         sector=sector,
         quanfury_only=quanfury_only,
         search=search,
+        symbol_exact=symbol_exact,
         min_div_yield=min_div_yield,
         min_rsi=min_rsi,
         max_rsi=max_rsi,
@@ -265,11 +343,15 @@ def list_stocks(
         near_52w_low=near_52w_low,
         min_health_score=min_health_score,
         max_health_score=max_health_score,
+        min_day_change_pct=min_day_change_pct,
+        max_day_change_pct=max_day_change_pct,
+        sp500_only=sp500_only,
         divergence=divergence,
         ema_52_for_div=ema_52_for_div,
         ema_200_for_div=ema_200_for_div,
         portfolio_id=portfolio_id,
         tech_complete=tech_complete,
+        exclude_value_traps=exclude_value_traps,
         for_list=True,
     )
 
@@ -287,9 +369,20 @@ def list_stocks(
         "health_score": StockFeature.health_score,
         "macd": StockFeature.macd,
         "dist_ema_200": dist_ema_200,
+        "day_change_pct": StockFeature.day_change_pct,
     }
     sort_col = sort_map.get(sort_by, Stock.ticker_yf)
-    nullable_sort = sort_by in ("health_score", "rsi_14", "macd", "last_close", "div_yield_ttm", "dist_ema_200", "max_drawdown", "dividend_ttm")
+    nullable_sort = sort_by in (
+        "health_score",
+        "rsi_14",
+        "macd",
+        "last_close",
+        "div_yield_ttm",
+        "dist_ema_200",
+        "max_drawdown",
+        "dividend_ttm",
+        "day_change_pct",
+    )
     if order == "desc":
         sort_expr = sort_col.desc()
     else:
@@ -319,6 +412,8 @@ def list_stocks(
             week_52_pct=compute_week_pct(f.last_close if f else None, f.week_52_high if f else None, f.week_52_low if f else None),
             next_earnings_date=f.next_earnings_date if f else None,
             health_score=f.health_score if f else None,
+            day_change_pct=f.day_change_pct if f else None,
+            possible_value_trap=bool(s.possible_value_trap),
         ))
 
     return PaginatedStocks(items=items, total=total, page=page, page_size=page_size, pages=(total + page_size - 1) // page_size)
@@ -331,6 +426,18 @@ class StockCreate(BaseModel):
     avg_price: float = 0
     portfolio_id: Optional[int] = None
     enrich: bool = True
+
+
+class StockIdentityPatch(BaseModel):
+    """Update Yahoo ticker, display symbol, and/or exchange without deleting the row."""
+
+    ticker_yf: Optional[str] = None
+    symbol: Optional[str] = None
+    exchange: Optional[str] = Field(None, description="Exchange code, e.g. NYSE, NASDAQ, TSX")
+
+
+class ValueTrapPatch(BaseModel):
+    possible_value_trap: bool
 
 
 EXCHANGE_ALIASES = {
@@ -401,6 +508,15 @@ def _enrich_from_yfinance(ticker_yf: str) -> dict:
     except Exception as e:
         log.warning("yfinance enrich failed for %s: %s", ticker_yf, e)
 
+    lc = info.get("last_close")
+    if lc is None or (isinstance(lc, (int, float)) and lc <= 0):
+        from services.market_data.fallback import secondary_last_close
+
+        p, src = secondary_last_close(ticker_yf)
+        if p is not None:
+            info["last_close"] = p
+            log.info("enrich: secondary last_close %s=%s (%s)", ticker_yf, p, src)
+
     return info
 
 
@@ -410,9 +526,8 @@ def create_stock(data: StockCreate, db: Session = Depends(get_db)):
     ticker = data.ticker.strip().upper()
     symbol = ticker.split(".")[0]
 
-    existing = db.query(Stock).filter(
-        or_(Stock.ticker_yf == ticker, Stock.symbol == symbol)
-    ).first()
+    # Match Yahoo ticker only — symbol is ambiguous across exchanges (e.g. HOOD vs HOOD.TO).
+    existing = db.query(Stock).filter(Stock.ticker_yf == ticker).first()
 
     _FEATURE_KEYS = [
         "last_close", "dividend_ttm", "div_yield_ttm",
@@ -516,9 +631,53 @@ def list_sectors(db: Session = Depends(get_db)):
 
 
 @router.get("/sector-stats")
-def sector_stats(db: Session = Depends(get_db)):
-    from sqlalchemy import func, case
-    rows = (
+def sector_stats(
+    exchange: Optional[str] = Query(None, description="Filter by exchange code, e.g. NYSE, NASDAQ, TSX"),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import case
+
+    below_ema = func.sum(
+        case(
+            (
+                and_(
+                    StockFeature.last_close.isnot(None),
+                    StockFeature.ema_200.isnot(None),
+                    StockFeature.last_close < StockFeature.ema_200,
+                ),
+                1,
+            ),
+            else_=0,
+        )
+    )
+    ema_eligible = func.sum(
+        case(
+            (
+                and_(
+                    StockFeature.last_close.isnot(None),
+                    StockFeature.ema_200.isnot(None),
+                ),
+                1,
+            ),
+            else_=0,
+        )
+    )
+    session_nonempty = func.sum(
+        case((StockFeature.day_change_pct.isnot(None), 1), else_=0),
+    )
+    session_up = func.sum(
+        case(
+            (and_(StockFeature.day_change_pct.isnot(None), StockFeature.day_change_pct > 0), 1),
+            else_=0,
+        ),
+    )
+    session_down = func.sum(
+        case(
+            (and_(StockFeature.day_change_pct.isnot(None), StockFeature.day_change_pct < 0), 1),
+            else_=0,
+        ),
+    )
+    base_q = (
         db.query(
             Stock.sector,
             func.count(Stock.id),
@@ -526,18 +685,201 @@ def sector_stats(db: Session = Depends(get_db)):
             func.sum(case((Stock.is_quanfury_available == True, 1), else_=0)),
             func.sum(case((StockFeature.dividend_ttm > 0, 1), else_=0)),
             func.sum(case((StockFeature.last_close.is_(None), 1), else_=0)),
+            func.avg(StockFeature.rsi_14),
+            func.avg(StockFeature.health_score),
+            below_ema,
+            ema_eligible,
+            func.avg(StockFeature.day_change_pct),
+            session_up,
+            session_down,
+            session_nonempty,
         )
         .outerjoin(StockFeature, Stock.id == StockFeature.stock_id)
+        .outerjoin(Exchange, Stock.exchange_id == Exchange.id)
         .filter(Stock.sector != "", Stock.sector.isnot(None))
-        .group_by(Stock.sector)
-        .order_by(func.count(Stock.id).desc())
-        .all()
     )
-    return [{"sector": r[0], "count": r[1],
-             "avg_div_yield": round(float(r[2]), 2) if r[2] else None,
-             "quanfury_count": int(r[3] or 0),
-             "with_dividends": int(r[4] or 0),
-             "missing_prices": int(r[5] or 0)} for r in rows]
+    if exchange and exchange.strip():
+        base_q = base_q.filter(Exchange.code == exchange.strip().upper())
+    rows = base_q.group_by(Stock.sector).order_by(func.count(Stock.id).desc()).all()
+    out = []
+    for r in rows:
+        elig = int(r[9] or 0)
+        below = int(r[8] or 0)
+        below_pct = round(100.0 * below / elig, 1) if elig > 0 else None
+        avg_rsi = float(r[6]) if r[6] is not None else None
+        avg_health = float(r[7]) if r[7] is not None else None
+        avg_day = float(r[10]) if r[10] is not None else None
+        up_ct = int(r[11] or 0)
+        dn_ct = int(r[12] or 0)
+        nn_ct = int(r[13] or 0)
+        rising_share = round(100.0 * up_ct / nn_ct, 1) if nn_ct > 0 else None
+        if avg_rsi is None and below_pct is None:
+            weak_trend = None
+        else:
+            weak_trend = (avg_rsi is not None and avg_rsi < 44.0) or (
+                below_pct is not None and below_pct >= 55.0
+            )
+        out.append(
+            {
+                "sector": r[0],
+                "count": r[1],
+                "avg_div_yield": round(float(r[2]), 2) if r[2] else None,
+                "quanfury_count": int(r[3] or 0),
+                "with_dividends": int(r[4] or 0),
+                "missing_prices": int(r[5] or 0),
+                "avg_rsi_14": round(avg_rsi, 2) if avg_rsi is not None else None,
+                "avg_health_score": round(avg_health, 2) if avg_health is not None else None,
+                "below_ema200_pct": below_pct,
+                "weak_trend": weak_trend,
+                "avg_day_change_pct": round(avg_day, 3) if avg_day is not None else None,
+                "session_rising_share_pct": rising_share,
+                "session_up_count": up_ct,
+                "session_down_count": dn_ct,
+                "session_change_known": nn_ct,
+            }
+        )
+    return out
+
+
+class SectorRenameBody(BaseModel):
+    from_sector: str = Field(..., description="Exact sector label to replace (all stocks with this value).")
+    to_sector: str = Field("", description="New label; empty clears the tag for those rows (same as clear-tag).")
+
+
+class SectorNameBody(BaseModel):
+    sector: str = Field(..., description="Exact sector label; all matching stocks get sector cleared.")
+
+
+@router.post("/sector/rename")
+def rename_sector_tag(body: SectorRenameBody, db: Session = Depends(get_db)):
+    old = body.from_sector.strip()
+    if not old:
+        raise HTTPException(status_code=400, detail="from_sector is required")
+    new = body.to_sector.strip()
+    n = (
+        db.query(Stock)
+        .filter(Stock.sector == old)
+        .update({Stock.sector: new}, synchronize_session=False)
+    )
+    db.commit()
+    return {"updated": int(n), "from_sector": old, "to_sector": new}
+
+
+@router.post("/sector/clear-tag")
+def clear_sector_tag(body: SectorNameBody, db: Session = Depends(get_db)):
+    sec = body.sector.strip()
+    if not sec:
+        raise HTTPException(status_code=400, detail="sector is required")
+    n = (
+        db.query(Stock)
+        .filter(Stock.sector == sec)
+        .update({Stock.sector: ""}, synchronize_session=False)
+    )
+    db.commit()
+    return {"updated": int(n), "sector": sec}
+
+
+class SectorSampleRefreshBody(BaseModel):
+    """Refresh a subset of tickers per sector (spread across ids) to update session % moves without hitting every row."""
+
+    sample_ratio: float = Field(0.2, ge=0.02, le=1.0)
+    max_workers: int = Field(1, ge=1, le=4)
+    sleep_seconds: float = Field(0.12, ge=0.0, le=2.0, description="Delay between Yahoo calls when max_workers=1.")
+    sector: Optional[str] = Field(
+        None,
+        description="Exact sector label. If set, only this sector is sampled; otherwise all non-empty sectors.",
+    )
+    exchange: Optional[str] = Field(
+        None,
+        description="If set, only stocks on this exchange code (e.g. NYSE) are sampled.",
+    )
+
+
+def _stock_ids_for_sector_exchange(db: Session, sector_label: str, exchange_code: Optional[str]) -> list[int]:
+    q = db.query(Stock.id).filter(Stock.sector == sector_label)
+    if exchange_code and exchange_code.strip():
+        ex = exchange_code.strip().upper()
+        q = q.join(Exchange, Stock.exchange_id == Exchange.id).filter(Exchange.code == ex)
+    return [r[0] for r in q.order_by(Stock.id).all()]
+
+
+def _run_sector_sample_refresh(body: SectorSampleRefreshBody, db: Session):
+    import math
+    import time as time_mod
+
+    ex_code = body.exchange.strip() if body.exchange else None
+    if body.sector and body.sector.strip():
+        label = body.sector.strip()
+        probe = _stock_ids_for_sector_exchange(db, label, ex_code)
+        if not probe:
+            detail = f"No stocks with sector '{label}'"
+            if ex_code:
+                detail += f" on exchange '{ex_code}'"
+            raise HTTPException(status_code=404, detail=detail)
+        sectors = [label]
+    else:
+        sectors = [
+            s[0]
+            for s in db.query(Stock.sector).distinct().filter(Stock.sector != "").order_by(Stock.sector).all()
+        ]
+    per_sector: list = []
+    all_ids: list[int] = []
+    for sec in sectors:
+        ids = _stock_ids_for_sector_exchange(db, sec, ex_code)
+        n = len(ids)
+        k = max(1, min(n, math.ceil(n * body.sample_ratio)))
+        picked = _pick_evenly_spaced_ids(ids, k)
+        all_ids.extend(picked)
+        per_sector.append({"sector": sec, "total": n, "refreshed": len(picked)})
+
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for sid in all_ids:
+        if sid not in seen:
+            seen.add(sid)
+            uniq.append(sid)
+
+    enriched = 0
+    failed = 0
+    details: list = []
+    workers = min(max(int(body.max_workers), 1), 4)
+
+    if workers > 1 and len(uniq) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for d in ex.map(_enrich_single_stock_thread, uniq):
+                details.append(d)
+                if d.get("status") == "ok":
+                    enriched += 1
+                else:
+                    failed += 1
+    else:
+        for stock_id in uniq:
+            d = _enrich_single_stock_thread(stock_id)
+            details.append(d)
+            if d.get("status") == "ok":
+                enriched += 1
+            else:
+                failed += 1
+            time_mod.sleep(body.sleep_seconds)
+
+    return {
+        "total_picked": len(uniq),
+        "enriched": enriched,
+        "failed": failed,
+        "per_sector": per_sector,
+        "details": details[:120],
+    }
+
+
+@router.post("/sector-sample-refresh")
+def sector_sample_refresh_flat(body: SectorSampleRefreshBody, db: Session = Depends(get_db)):
+    """Preferred path (single segment) — avoids proxies that mishandle `/sectors/sample-refresh`."""
+    return _run_sector_sample_refresh(body, db)
+
+
+@router.post("/sectors/sample-refresh")
+def sector_sample_refresh_nested(body: SectorSampleRefreshBody, db: Session = Depends(get_db)):
+    return _run_sector_sample_refresh(body, db)
 
 
 def _build_price_normalization(stock_id: int, db: Session) -> PriceNormalizationOut:
@@ -809,8 +1151,13 @@ def _refresh_stock_data(stock: Stock, feature: StockFeature, db: Session):
             close = hist["Close"].dropna()
             if hasattr(close, 'columns'):
                 close = close.iloc[:, 0]
-            if not close.empty and len(close) >= 2:
+            if not close.empty:
                 feature.last_close = float(close.iloc[-1])
+                if len(close) >= 2:
+                    prev_c = float(close.iloc[-2])
+                    cur_c = float(close.iloc[-1])
+                    feature.day_change_pct = round((cur_c - prev_c) / prev_c * 100, 4) if prev_c else None
+            if not close.empty and len(close) >= 2:
 
                 n52 = min(252, len(close))
                 n100 = min(500, len(close))
@@ -865,6 +1212,18 @@ def _refresh_stock_data(stock: Stock, feature: StockFeature, db: Session):
     except Exception as e:
         log.warning("refresh failed for %s: %s", ticker_yf, e, exc_info=True)
 
+    if feature.last_close is None:
+        from services.market_data.fallback import secondary_last_close
+
+        p, src = secondary_last_close(ticker_yf)
+        if p is not None:
+            feature.last_close = p
+            try:
+                db.commit()
+                log.info("REFRESH %s: last_close=%s from secondary (%s)", ticker_yf, p, src)
+            except Exception as ce:
+                log.warning("secondary last_close commit failed for %s: %s", ticker_yf, ce)
+
 
 class ScoreTrendStatsOut(BaseModel):
     total: int
@@ -876,6 +1235,7 @@ class ScoreTrendStatsOut(BaseModel):
 
 def _score_trend_common_kwargs(
     exchange, sector, quanfury_only, search, portfolio_id, min_health_score, max_health_score, tech_complete,
+    min_day_change_pct=None, max_day_change_pct=None, sp500_only=False, exclude_value_traps=False,
 ):
     return dict(
         exchange=exchange,
@@ -885,7 +1245,11 @@ def _score_trend_common_kwargs(
         portfolio_id=portfolio_id,
         min_health_score=min_health_score,
         max_health_score=max_health_score,
+        min_day_change_pct=min_day_change_pct,
+        max_day_change_pct=max_day_change_pct,
+        sp500_only=sp500_only,
         tech_complete=tech_complete,
+        exclude_value_traps=exclude_value_traps,
         divergence=None,
         for_list=False,
     )
@@ -900,12 +1264,20 @@ def score_trend_stats(
     portfolio_id: Optional[int] = Query(None),
     min_health_score: Optional[float] = Query(None),
     max_health_score: Optional[float] = Query(None),
+    min_day_change_pct: Optional[float] = Query(None),
+    max_day_change_pct: Optional[float] = Query(None),
+    sp500_only: bool = Query(False),
     tech_complete: bool = Query(False),
+    exclude_value_traps: bool = Query(False, description="Hide stocks marked as possible value trap"),
     db: Session = Depends(get_db),
 ):
     """Counts for score vs EMA screening (same base filters as list, no divergence filter)."""
     kw = _score_trend_common_kwargs(
         exchange, sector, quanfury_only, search, portfolio_id, min_health_score, max_health_score, tech_complete,
+        min_day_change_pct=min_day_change_pct,
+        max_day_change_pct=max_day_change_pct,
+        sp500_only=sp500_only,
+        exclude_value_traps=exclude_value_traps,
     )
     base = _stocks_list_base_query(db, **kw)
     total = base.count()
@@ -1004,6 +1376,10 @@ def get_stock(stock_id: int, refresh: bool = Query(False, description="Force ref
         if p:
             portfolio_list.append({"id": p.id, "name": p.name, "shares": h.shares})
 
+    from services.dividend_capture import next_dividend_capture
+
+    div_capture = next_dividend_capture(db, stock.id, f.last_close if f else None)
+
     return StockDetailOut(
         id=stock.id, ticker_yf=stock.ticker_yf, symbol=stock.symbol, company_name=stock.company_name,
         exchange_code=exc.code if exc else None, sector=stock.sector, currency=stock.currency,
@@ -1017,6 +1393,7 @@ def get_stock(stock_id: int, refresh: bool = Query(False, description="Force ref
         week_52_high=f.week_52_high if f else None, week_52_low=f.week_52_low if f else None,
         week_52_pct=compute_week_pct(f.last_close if f else None, f.week_52_high if f else None, f.week_52_low if f else None),
         next_earnings_date=f.next_earnings_date if f else None,
+        day_change_pct=f.day_change_pct if f else None,
         eps_estimate=f.eps_estimate if f else None, reported_eps=f.reported_eps if f else None,
         surprise_pct=f.surprise_pct if f else None,
         week_100_high=f.week_100_high if f else None, week_100_low=f.week_100_low if f else None,
@@ -1031,8 +1408,102 @@ def get_stock(stock_id: int, refresh: bool = Query(False, description="Force ref
         total_debt=f.total_debt if f else None,
         debt_to_equity=f.debt_to_equity if f else None,
         health_score=f.health_score if f else None,
+        next_ex_date=div_capture["next_ex_date"],
+        next_div_amount=div_capture["next_div_amount"],
+        days_to_next_ex=div_capture["days_to_next_ex"],
+        exp_div_apy_pct=div_capture["exp_div_apy_pct"],
+        next_div_source=div_capture["next_div_source"],
         dividend_history=div_history, portfolios=portfolio_list,
     )
+
+
+def _apply_stock_identity_update(stock_id: int, data: StockIdentityPatch, db: Session):
+    """Shared implementation for PATCH /stocks/{id} and POST /stocks/{id}/identity."""
+    if data.ticker_yf is None and data.symbol is None and data.exchange is None:
+        raise HTTPException(status_code=400, detail="Provide at least one of: ticker_yf, symbol, exchange")
+
+    stock = db.query(Stock).filter(Stock.id == stock_id).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+
+    if data.ticker_yf is not None:
+        new_ticker = data.ticker_yf.strip().upper()
+        if not new_ticker:
+            raise HTTPException(status_code=400, detail="ticker_yf cannot be empty")
+        conflict = (
+            db.query(Stock)
+            .filter(Stock.ticker_yf == new_ticker, Stock.id != stock_id)
+            .first()
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ticker {new_ticker} is already used by stock id={conflict.id}",
+            )
+        stock.ticker_yf = new_ticker
+        if data.symbol is None:
+            stock.symbol = new_ticker.split(".")[0]
+
+    if data.symbol is not None:
+        sym = data.symbol.strip()
+        if not sym:
+            raise HTTPException(status_code=400, detail="symbol cannot be empty")
+        stock.symbol = sym
+
+    if data.exchange is not None:
+        raw = data.exchange.strip().upper()
+        if not raw:
+            raise HTTPException(status_code=400, detail="exchange cannot be empty")
+        exchange_code = EXCHANGE_ALIASES.get(raw, raw)
+        exc = db.query(Exchange).filter_by(code=exchange_code).first()
+        if not exc:
+            exc = Exchange(code=exchange_code, name=exchange_code)
+            db.add(exc)
+            db.flush()
+        stock.exchange_id = exc.id
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        log.warning("stock identity update failed id=%s: %s", stock_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not update stock") from e
+
+    return get_stock(stock_id, False, db)
+
+
+@router.patch("/{stock_id}", response_model=StockDetailOut)
+def patch_stock_identity(stock_id: int, data: StockIdentityPatch, db: Session = Depends(get_db)):
+    """Fix ticker_yf / symbol / exchange when Yahoo or import metadata was wrong."""
+    return _apply_stock_identity_update(stock_id, data, db)
+
+
+@router.post("/{stock_id}/identity", response_model=StockDetailOut)
+def post_stock_identity(stock_id: int, data: StockIdentityPatch, db: Session = Depends(get_db)):
+    """Same as PATCH /stocks/{id}; use from clients that cannot send PATCH (405)."""
+    return _apply_stock_identity_update(stock_id, data, db)
+
+
+@router.post("/{stock_id}/value-trap", response_model=StockDetailOut)
+def post_value_trap_flag(stock_id: int, data: ValueTrapPatch, db: Session = Depends(get_db)):
+    """Mark or unmark a stock as a possible value trap (hidden from Score vs trend when marked)."""
+    stock = db.query(Stock).filter(Stock.id == stock_id).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    stock.possible_value_trap = data.possible_value_trap
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        log.warning("value trap flag update failed id=%s: %s", stock_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not update value trap flag") from e
+    log.info(
+        "VALUE_TRAP stock id=%s ticker_yf=%s marked=%s",
+        stock_id,
+        stock.ticker_yf,
+        data.possible_value_trap,
+    )
+    return get_stock(stock_id, False, db)
 
 
 @router.post("/{stock_id}/refresh-prices")
@@ -1073,6 +1544,7 @@ def refresh_stock_prices(stock_id: int, db: Session = Depends(get_db)):
         "week_100_low": f.week_100_low,
         "week_200_high": f.week_200_high,
         "week_200_low": f.week_200_low,
+        "day_change_pct": f.day_change_pct,
     }
 
 
@@ -1194,14 +1666,18 @@ class FilteredEnrichRequest(BaseModel):
     max_rsi: Optional[float] = None
     min_health_score: Optional[float] = None
     max_health_score: Optional[float] = None
+    min_day_change_pct: Optional[float] = None
+    max_day_change_pct: Optional[float] = None
+    sp500_only: bool = False
     divergence: Optional[str] = Field(
         None,
-        description="strong_below_selected | poor_above_any | poor_above_all",
+        description="strong_below_selected | below_selected_emas | poor_above_any | poor_above_all",
     )
     ema_52_for_div: bool = True
     ema_200_for_div: bool = True
     portfolio_id: Optional[int] = None
     tech_complete: bool = False
+    exclude_value_traps: bool = False
     batch_size: int = Field(10, ge=1, le=1000)
     force: bool = False
     offset: int = 0
@@ -1299,11 +1775,15 @@ def enrich_filtered(data: FilteredEnrichRequest, db: Session = Depends(get_db)):
         near_52w_low=data.near_52w_low,
         min_health_score=data.min_health_score,
         max_health_score=data.max_health_score,
+        min_day_change_pct=data.min_day_change_pct,
+        max_day_change_pct=data.max_day_change_pct,
+        sp500_only=data.sp500_only,
         divergence=data.divergence,
         ema_52_for_div=data.ema_52_for_div,
         ema_200_for_div=data.ema_200_for_div,
         portfolio_id=data.portfolio_id,
         tech_complete=data.tech_complete,
+        exclude_value_traps=data.exclude_value_traps,
         for_list=True,
     )
 

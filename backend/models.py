@@ -27,6 +27,7 @@ class Stock(Base):
     currency = Column(String(10), default="")
     market_cap = Column(Float, default=0)
     is_quanfury_available = Column(Boolean, default=False)
+    possible_value_trap = Column(Boolean, default=False, nullable=False)
     isin = Column(String(20), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -57,6 +58,8 @@ class StockFeature(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False, unique=True)
     last_close = Column(Float)
+    # Last bar vs prior close (%), from yfinance history at refresh (not live intraday).
+    day_change_pct = Column(Float)
     max_drawdown = Column(Float)
     ema_20 = Column(Float)
     ema_52 = Column(Float)
@@ -150,10 +153,27 @@ class DividendCalendarNote(Base):
     __tablename__ = "dividend_calendar_notes"
     id = Column(Integer, primary_key=True, autoincrement=True)
     note_date = Column(Date, nullable=False)
+    title = Column(String(255), default="")
     body = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (
         Index("idx_div_cal_note_date", "note_date"),
+    )
+
+
+class JournalEntry(Base):
+    """Free-form journal note for the unified bitácora hub."""
+
+    __tablename__ = "journal_entries"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(255), default="")
+    body = Column(Text, nullable=False)
+    target_date = Column(Date, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        Index("idx_journal_target_date", "target_date"),
     )
 
 

@@ -1,18 +1,18 @@
 services:
   - type: web
     name: stock-portfolio-api
-    runtime: python
+    runtime: docker
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: DATABASE_PATH
-        value: /var/data/stock_unifier.db
-      - key: DATA_DIR
-        value: /opt/render/project/src/data
+        value: /app/stock_unifier.db
+      - key: DB_REPO
+        value: Qleoz12/stock-portfolio-db
+      - key: DB_RELEASE_TAG
+        value: v1.0.0
+      - key: DB_ASSET_NAME
+        value: stock_unifier.db
       - key: CORS_ORIGINS
-        value: https://stock-portfolio-web.onrender.com
-    disk:
-      name: spu-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: "*"
+      # Set GITHUB_TOKEN manually in Render dashboard (secret)

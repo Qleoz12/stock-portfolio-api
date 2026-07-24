@@ -72,6 +72,9 @@ class OperationOut(BaseModel):
     notes: str
     created_at: str
 
+class OperationNotesPatch(BaseModel):
+    notes: str
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Individual fetchers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +124,7 @@ async def fetch_exchangerate(client: httpx.AsyncClient) -> list[dict]:
         pairs_wanted = [
             ("USD", "COP", "USD/COP"),
             ("USD", "CAD", "USD/CAD"),
+            ("USD", "MXN", "USD/MXN"),
         ]
         cop = rates.get("COP")
         cad = rates.get("CAD")
@@ -662,6 +666,22 @@ def list_operations(limit: int = 50, db: Session = Depends(get_db)):
         )
         for o in ops
     ]
+
+
+@router.patch("/operations/{operation_id}", response_model=OperationOut)
+def patch_operation_notes(operation_id: int, payload: OperationNotesPatch, db: Session = Depends(get_db)):
+    op = db.query(ArbitrageOperation).filter_by(id=operation_id).first()
+    if not op:
+        raise HTTPException(status_code=404, detail="Operation not found")
+    op.notes = payload.notes
+    db.commit()
+    db.refresh(op)
+    return OperationOut(
+        id=op.id, pair=op.pair, buy_source=op.buy_source, sell_source=op.sell_source,
+        buy_price=op.buy_price, sell_price=op.sell_price, amount_usdt=op.amount_usdt,
+        fee_total=op.fee_total, net_profit=op.net_profit, net_profit_pct=op.net_profit_pct,
+        status=op.status, notes=op.notes, created_at=op.created_at.isoformat(),
+    )
 
 
 @router.get("/p2p/book")
